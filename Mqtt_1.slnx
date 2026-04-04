@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Mqtt_1/Mqtt_1.vcxproj" Id="ffcaf858-c4df-494c-9667-7b83259fa986" />
+</Solution>
