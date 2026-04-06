@@ -5,14 +5,16 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
-
+#include "Trie.h"
 
 using boost::asio::ip::tcp;
 
 class Session;
 
-std::mutex subscriptions_mutex_;
-std::unordered_map<std::string, std::vector<std::weak_ptr<Session>>> subscriptions_;
+Trie topic_trie_;
+std::mutex trie_mutex_;
+
+
 
 std::mutex clients_mutex_;
 std::unordered_map<std::string, std::weak_ptr<Session>> clients_;
@@ -37,25 +39,35 @@ private:
         socket_.async_read_some(
             boost::asio::buffer(temp_buffer_),
             [this, self](boost::system::error_code ec, std::size_t length) {
-                if (!ec) {
-                    // Append to persistent buffer
-                    read_buffer_.insert(
-                        read_buffer_.end(),
-                        temp_buffer_.begin(),
-                        temp_buffer_.begin() + length
-                    );
-
-                    process_buffer(); // <-- NEW
-                    do_read();
-                }
-
                 if (ec) {
                     std::cout << "Client disconnected: " << client_id_ << std::endl;
                     unregister_client();
                     return;
                 }
+
+                // Append to persistent buffer
+                read_buffer_.insert(
+                    read_buffer_.end(),
+                    temp_buffer_.begin(),
+                    temp_buffer_.begin() + length
+                );
+
+                process_buffer();
+                do_read();
             }
         );
+    }
+
+    std::vector<std::string> split_topic(const std::string& topics) {
+        std::vector<std::string> result;
+        std::stringstream ss(topics);
+        std::string item;
+
+        while (std::getline(ss, item, ',')) {
+            result.push_back(item);
+		}
+
+        return result;
     }
 
     void disconnect_ack() {
@@ -117,7 +129,6 @@ private:
         case 1:
             handle_connect(packet);
             break;
-
         case 3:
             handle_publish(packet);
             break;
@@ -189,8 +200,8 @@ private:
 
             // Store subscription
             {
-                std::lock_guard<std::mutex> lock(subscriptions_mutex_);
-                subscriptions_[topic].push_back(shared_from_this());
+                std::lock_guard<std::mutex> lock(trie_mutex_);
+                topic_trie_.subscribe(topic, client_id_);
             }
 
             return_codes.push_back(qos); // granted QoS
@@ -254,18 +265,24 @@ private:
     }
 
     void route_message(const std::string& topic, const std::vector<uint8_t>& payload) {
-        std::vector<std::weak_ptr<Session>> subs_snapshot;
+        std::set<std::string> matched_client_ids;
 
         {
-            std::lock_guard<std::mutex> lock(subscriptions_mutex_);
-            auto it = subscriptions_.find(topic);
-            if (it == subscriptions_.end()) return;
-            subs_snapshot = it->second;  // copy before releasing lock
+            std::lock_guard<std::mutex> lock(trie_mutex_);
+			topic_trie_.match_topic(topic, matched_client_ids);
         }
 
-        for (auto& weak_sub : subs_snapshot) {
-            if (auto sub = weak_sub.lock()) {
-                std::cout << "Routing message to clinet: " << sub->client_id_ << std::endl;
+        for (const auto& id : matched_client_ids) {
+            std::shared_ptr<Session> sub;
+            { 
+                std::lock_guard<std::mutex> lock(clients_mutex_);
+                auto it = clients_.find(id);
+                if (it == clients_.end()) continue;
+
+                sub = it->second.lock();
+            }
+            if (sub) {
+                std::cout << "Routing message to client: " << id << std::endl;
                 sub->send_publish(topic, payload);
             }
         }
@@ -342,13 +359,13 @@ private:
             socket_,
             boost::asio::buffer(connack, sizeof(connack)),
             [this, self](boost::system::error_code ec, std::size_t) {
-                if (!ec) {
-                    std::cout << "CONNACK sent to client: "
-                        << client_id_ << std::endl;
-                }
-                else {
+                if(ec) {
                     std::cout << "Failed to send CONNACK\n";
+                    return;
                 }
+                
+                std::cout << "CONNACK sent to client: "
+                    << client_id_ << std::endl;
             }
         );
     }
@@ -360,6 +377,7 @@ private:
         if (clients_.count(client_id_)) {
             std::cout << "Client ID already exists, replacing: "
                 << client_id_ << std::endl;
+
         }
 
         clients_[client_id_] = shared_from_this();
@@ -371,20 +389,6 @@ private:
         if (!client_id_.empty()) {
             clients_.erase(client_id_);
         }
-    }
-
-    void do_write(std::size_t length) {
-        auto self = shared_from_this();
-        boost::asio::async_write(
-            socket_,
-            boost::asio::buffer(read_buffer_, length),
-            [this, self](boost::system::error_code ec, std::size_t /*length*/) {
-                if (!ec) {
-					std::cout << "Message sent to client: " << client_id_ << std::endl;
-                    do_read(); // keep reading more data
-                }
-            }
-        );
     }
 };
 
@@ -413,8 +417,8 @@ private:
 int main() {
     try {
         boost::asio::io_context io_context;
-        Server server(io_context, 1884); 
-        std::cout << "Server running on port 1884..." << std::endl;
+        Server server(io_context, 1883); 
+        std::cout << "Server running on port 1883..." << std::endl;
         io_context.run();
     }
     catch (std::exception& e) {
